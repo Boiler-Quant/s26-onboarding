@@ -1,1 +1,128 @@
+//@version=5
+strategy("IFVG + Liquidity Sweep + RSI Div [Reversal]", overlay=true, initial_capital=100000, default_qty_type=strategy.percent_of_equity, default_qty_value=100)
 
+// --- Inputs ---
+group_main = "Strategy Settings"
+lookback = input.int(5, "Liquidity Lookback (Bars)", group=group_main) 
+rr_ratio = input.float(2.0, "Risk:Reward Ratio (If TP Used)", group=group_main) 
+round_num_step = input.int(100, "Key Level Step", group=group_main)
+
+group_filters = "Filters"
+use_vol = input.bool(true, "Require Volume Spike?", group=group_filters)
+vol_mult = input.float(1.5, "Volume Multiplier (vs Avg)", group=group_filters)
+rsi_len = input.int(14, "RSI Length", group=group_filters)
+
+group_exit = "Exit & Hold Settings" 
+use_fixed_tp = input.bool(false, "Use Fixed Take Profit?", tooltip="Uncheck this to HOLD positions until a reversal signal.", group=group_exit)
+use_trail = input.bool(true, "Use Trailing Stop?", group=group_exit)
+trail_act = input.float(1.0, "Activation (x Risk)", tooltip="Start trailing after profit hits 1x Risk", group=group_exit)
+trail_dist = input.float(0.5, "Trail Distance (x Risk)", tooltip="Trail behind price by 0.5x Risk", group=group_exit)
+
+// --- 1. Helper Functions & Indicators ---
+rsi = ta.rsi(close, rsi_len) 
+vol_ma = ta.sma(volume, 20)
+vol_spike = use_vol ? (volume > vol_ma * vol_mult) : true
+
+// Round Number Detection
+is_round_level(src, step) => 
+    math.floor(src / step) != math.floor(src[1] / step)
+
+// --- 2. Identify Liquidity Sweeps ---
+piv_high = ta.pivothigh(high, lookback, lookback)
+piv_low = ta.pivotlow(low, lookback, lookback)
+
+var float last_liq_high = na
+var float last_liq_low = na
+
+if not na(piv_high)
+    last_liq_high := piv_high
+if not na(piv_low)
+    last_liq_low := piv_low
+
+sweep_high_piv = ta.highest(high, 3) > last_liq_high
+sweep_low_piv = ta.lowest(low, 3) < last_liq_low
+
+sweep_high_key = is_round_level(high, round_num_step) and vol_spike
+sweep_low_key = is_round_level(low, round_num_step) and vol_spike
+
+has_swept_high = sweep_high_piv or sweep_high_key
+has_swept_low = sweep_low_piv or sweep_low_key
+
+// --- 3. FVG Identification & Storage ---
+bull_fvg = low > high[2]
+bear_fvg = high < low[2]
+
+var float bear_fvg_top = na
+var float bear_fvg_btm = na
+var float bull_fvg_top = na
+var float bull_fvg_btm = na
+
+if bear_fvg
+    bear_fvg_top := low[2]
+    bear_fvg_btm := high
+if bull_fvg
+    bull_fvg_top := low
+    bull_fvg_btm := high[2]
+
+// --- 4. RSI Divergence / Swing Logic ---
+rsi_swing_up = rsi > rsi[1] and rsi[1] < rsi[2]
+rsi_swing_down = rsi < rsi[1] and rsi[1] > rsi[2]
+
+// --- 5. Entry Conditions ---
+
+// LONG LOGIC
+in_bear_gap = high > bear_fvg_btm and low < bear_fvg_top
+valid_long_sweep = has_swept_low
+long_trigger = (in_bear_gap and rsi_swing_up) or (valid_long_sweep and bull_fvg)
+
+// SHORT LOGIC
+in_bull_gap = low < bull_fvg_top and high > bull_fvg_btm
+valid_short_sweep = has_swept_high
+short_trigger = (in_bull_gap and rsi_swing_down) or (valid_short_sweep and bear_fvg)
+
+// --- 6. Execution (Reversal Logic) ---
+
+// Determine Stop Loss Prices (Calculated on signal)
+float long_sl_price = in_bear_gap ? bear_fvg_btm : (bull_fvg ? bull_fvg_btm : low)
+float short_sl_price = in_bull_gap ? bull_fvg_top : (bear_fvg ? bear_fvg_top : high)
+
+// EXECUTE LONG
+// We removed 'strategy.position_size == 0' so it can flip from Short to Long
+if long_trigger
+    float risk = close - long_sl_price
+    if risk > 0 
+        float tp_price = use_fixed_tp ? close + (risk * rr_ratio) : na // Only set TP if checkbox enabled
+        
+        // Trailing calculations
+        float trail_act_ticks = (risk * trail_act) / syminfo.mintick
+        float trail_dist_ticks = (risk * trail_dist) / syminfo.mintick
+        
+        strategy.entry("Long", strategy.long, comment="L | Flip")
+        
+        // Exit Logic
+        // If use_fixed_tp is false, we do not pass a 'limit' argument, so it holds indefinitely
+        if use_trail
+            strategy.exit("Exit Long", "Long", stop=long_sl_price, limit=tp_price, trail_points=trail_act_ticks, trail_offset=trail_dist_ticks)
+        else
+            strategy.exit("Exit Long", "Long", stop=long_sl_price, limit=tp_price)
+
+// EXECUTE SHORT
+if short_trigger
+    float risk = short_sl_price - close
+    if risk > 0 
+        float tp_price = use_fixed_tp ? close - (risk * rr_ratio) : na 
+        
+        float trail_act_ticks = (risk * trail_act) / syminfo.mintick
+        float trail_dist_ticks = (risk * trail_dist) / syminfo.mintick
+        
+        strategy.entry("Short", strategy.short, comment="S | Flip")
+        
+        if use_trail
+            strategy.exit("Exit Short", "Short", stop=short_sl_price, limit=tp_price, trail_points=trail_act_ticks, trail_offset=trail_dist_ticks)
+        else
+            strategy.exit("Exit Short", "Short", stop=short_sl_price, limit=tp_price)
+
+// --- Visuals ---
+plot(last_liq_high, "Liq High", color=color.new(color.red, 50), style=plot.style_circles)
+plot(last_liq_low, "Liq Low", color=color.new(color.green, 50), style=plot.style_circles)
+bgcolor(sweep_high_key or sweep_low_key ? color.new(color.yellow, 80) : na, title="Key Level Sweep")
